@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Gnosis Pay Direct Recovery</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/5.7.2/ethers.umd.min.js"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+    .card { background: #1e293b; border-radius: 12px; padding: 2rem; width: 520px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
+    h2 { margin-top: 0; font-size: 1.3rem; }
+    button { width: 100%; padding: 0.8rem; font-size: 1rem; font-weight: 600; border-radius: 8px; border: none; cursor: pointer; margin-top: 0.8rem; transition: background 0.2s; }
+    .btn-connect { background: #38bdf8; color: #0f172a; }
+    .btn-queue { background: #f59e0b; color: #0f172a; }
+    .btn-exec { background: #22c55e; color: #0f172a; }
+    button:disabled { opacity: 0.35; cursor: not-allowed; }
+    .info { margin: 0.6rem 0; font-size: 0.85rem; word-break: break-all; color: #94a3b8; }
+    .highlight { color: #38bdf8; font-weight: bold; }
+    .balance { font-size: 1.4rem; color: #4ade80; margin: 0.6rem 0; font-weight: bold; }
+    pre { background: #0b1120; padding: 0.8rem; border-radius: 6px; font-size: 0.75rem; overflow-x: auto; color: #cbd5e1; white-space: pre-wrap; word-break: break-all; max-height: 200px; }
+    .timer { font-size: 1.1rem; color: #fbbf24; font-weight: bold; margin: 0.5rem 0; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Gnosis Pay Direct Recovery</h2>
+    
+    <div id="step-connect">
+      <button class="btn-connect" id="btnConnect" onclick="connectWallet()">Connect Rainbow Wallet</button>
+    </div>
+
+    <div id="wallet-info" style="display:none;">
+      <div class="info">Connected EOA: <span class="highlight" id="lblSigner">-</span></div>
+      <div class="info">Safe Address: <span class="highlight">0x905314491E170F2c86695f54467f96292cEBE7E4</span></div>
+      <div class="balance" id="lblBalance">Checking balance...</div>
+
+      <div class="info">Delay Module: <span class="highlight">0x23dFB2dB0Ea537392452284874C201Ee6e2Ab863</span></div>
+      <div class="info">Queue Nonce: <span class="highlight" id="lblQNonce">-</span> | Tx Nonce: <span class="highlight" id="lblTNonce">-</span></div>
+
+      <button class="btn-queue" id="btnQueue" onclick="queueWithdrawal()" disabled>Step 1: Enqueue Withdrawal (Direct on Delay)</button>
+      
+      <div id="timerContainer" style="display:none; text-align: center; margin-top: 1rem;">
+        <div class="timer" id="lblTimer">Cooldown: 180s</div>
+      </div>
+
+      <button class="btn-exec" id="btnExecute" onclick="executeWithdrawal()" disabled>Step 2: Execute Withdrawal (Release Tokens)</button>
+
+      <div class="info" style="margin-top: 1.2rem;">Status / Activity Log:</div>
+      <pre id="log">Ready.</pre>
+    </div>
+  </div>
+
+  <script>
+    const SAFE_ADDRESS = "0x905314491E170F2c86695f54467f96292cEBE7E4";
+    const NEW_GBPE_TOKEN = "0x8E34bfEC4f6Eb781f9743D9b4af99CD23F9b7053";
+    const DELAY_MODULE = "0x23dFB2dB0Ea537392452284874C201Ee6e2Ab863";
+
+    const DELAY_ABI = [
+      "function execTransactionFromModule(address to, uint256 value, bytes data, uint8 operation) returns (bool)",
+      "function executeNextTx(address to, uint256 value, bytes data, uint8 operation)",
+      "function queueNonce() view returns (uint256)",
+      "function txNonce() view returns (uint256)",
+      "function getTxCreatedAt(uint256 _nonce) view returns (uint256)",
+      "function txCooldown() view returns (uint256)"
+    ];
+
+    let provider, signer, signerAddress, tokenBalanceWei, delayContract;
+
+    function log(msg) {
+      document.getElementById("log").innerText = typeof msg === "object" ? JSON.stringify(msg, null, 2) : msg;
+    }
+
+    async function connectWallet() {
+      if (!window.ethereum) return alert("Rainbow / EVM wallet not detected.");
+      
+      provider = new ethers.providers.Web3Provider(window.ethereum);
+      await provider.send("eth_requestAccounts", []);
+      
+      const network = await provider.getNetwork();
+      if (network.chainId !== 100) {
+        try {
+          await window.ethereum.request({
+            method: "wallet_switchEthereumChain",
+            params: [{ chainId: "0x64" }]
+          });
+          provider = new ethers.providers.Web3Provider(window.ethereum);
+        } catch (e) {
+          return alert("Please switch your wallet to Gnosis Chain.");
+        }
+      }
+
+      signer = provider.getSigner();
+      signerAddress = await signer.getAddress();
+      delayContract = new ethers.Contract(DELAY_MODULE, DELAY_ABI, signer);
+
+      document.getElementById("step-connect").style.display = "none";
+      document.getElementById("wallet-info").style.display = "block";
+      document.getElementById("lblSigner").innerText = signerAddress;
+
+      await refreshState();
+    }
+
+    async function getTransferCalldata() {
+      const erc20 = new ethers.Contract(NEW_GBPE_TOKEN, ["function transfer(address to, uint256 amount)"], provider);
+      return erc20.interface.encodeFunctionData("transfer", [signerAddress, tokenBalanceWei]);
+    }
+
+    async function refreshState() {
+      const erc20 = new ethers.Contract(
+        NEW_GBPE_TOKEN,
+        ["function balanceOf(address) view returns (uint256)"],
+        provider
+      );
+      tokenBalanceWei = await erc20.balanceOf(SAFE_ADDRESS);
+      const formatted = ethers.utils.formatEther(tokenBalanceWei);
+      document.getElementById("lblBalance").innerText = `${formatted} GBPe`;
+
+      const qNonce = await delayContract.queueNonce();
+      const tNonce = await delayContract.txNonce();
+      document.getElementById("lblQNonce").innerText = qNonce.toString();
+      document.getElementById("lblTNonce").innerText = tNonce.toString();
+
+      if (qNonce.gt(tNonce)) {
+        // A transaction is currently queued!
+        document.getElementById("btnQueue").disabled = true;
+        checkCooldown(tNonce);
+      } else if (tokenBalanceWei.gt(0)) {
+        document.getElementById("btnQueue").disabled = false;
+        document.getElementById("btnExecute").disabled = true;
+        log(`Ready to enqueue withdrawal of ${formatted} GBPe.`);
+      }
+    }
+
+    async function checkCooldown(tNonce) {
+      const createdAt = await delayContract.getTxCreatedAt(tNonce);
+      const cooldown = await delayContract.txCooldown();
+      const readyAt = createdAt.add(cooldown).toNumber();
+      
+      document.getElementById("timerContainer").style.display = "block";
+
+      const updateTimer = () => {
+        const now = Math.floor(Date.now() / 1000);
+        const remaining = readyAt - now;
+
+        if (remaining <= 0) {
+          document.getElementById("lblTimer").innerText = "Cooldown complete! Ready to execute.";
+          document.getElementById("lblTimer").style.color = "#4ade80";
+          document.getElementById("btnExecute").disabled = false;
+        } else {
+          document.getElementById("lblTimer").innerText = `Cooldown remaining: ${remaining}s`;
+          setTimeout(updateTimer, 1000);
+        }
+      };
+      updateTimer();
+    }
+
+    async function queueWithdrawal() {
+      try {
+        log("Encoding direct transfer on Delay Modifier...");
+        const transferCalldata = await getTransferCalldata();
+
+        log("Submitting execTransactionFromModule to Delay Modifier (0x23dF...)...");
+        // operation = 0 (Call)
+        const tx = await delayContract.execTransactionFromModule(
+          NEW_GBPE_TOKEN,
+          0,
+          transferCalldata,
+          0
+        );
+
+        log(`Queue transaction sent! Tx Hash: ${tx.hash}\nWaiting for block confirmation...`);
+        await tx.wait();
+        log(`Transaction successfully queued on-chain!\nStarting 180s cooldown timer...`);
+        await refreshState();
+      } catch (err) {
+        log({ error: err.message || err });
+      }
+    }
+
+    async function executeWithdrawal() {
+      try {
+        log("Executing next transaction from Delay queue...");
+        const transferCalldata = await getTransferCalldata();
+
+        const tx = await delayContract.executeNextTx(
+          NEW_GBPE_TOKEN,
+          0,
+          transferCalldata,
+          0
+        );
+
+        log(`Execute transaction sent! Tx Hash: ${tx.hash}\nWaiting for block confirmation...`);
+        await tx.wait();
+        log(`SUCCESS! 17.86 GBPe has been transferred directly to your EOA!`);
+        await refreshState();
+      } catch (err) {
+        log({ error: err.message || err });
+      }
+    }
+  </script>
+</body>
+</html>
